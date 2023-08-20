@@ -13,7 +13,6 @@ import (
 	"os/signal"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -75,7 +74,7 @@ func main() {
 	defer closeFunc()
 
 	log.Printf("XDP program successfully loaded and attached to %q", *ifaceName)
-	log.Printf("Press CTRL+C to stop, will also detach? I think so")
+	log.Printf("Press CTRL+C to stop, will not del tc filter")
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, os.Kill)
 	<-sig
@@ -104,12 +103,9 @@ func loadEbpf(iface *net.Interface, sPort, dPort uint16, dIPV4 net.IP) (func(), 
 	}
 
 	// From Leon: need to specify type for tc ebpf program
-	simpleLbEgress, ok := bpfSpec.Programs["simple_lb_egress"]
-	if !ok {
-		return nil, fmt.Errorf("cannot find simple_lb_egress program in collection")
+	for _, p := range bpfSpec.Programs {
+		p.Type = ebpf.SchedCLS
 	}
-
-	simpleLbEgress.Type = ebpf.SchedCLS
 
 	if err := bpfSpec.LoadAndAssign(objs, nil); err != nil {
 		var verr *ebpf.VerifierError
@@ -119,31 +115,13 @@ func loadEbpf(iface *net.Interface, sPort, dPort uint16, dIPV4 net.IP) (func(), 
 		return nil, fmt.Errorf("cannot load and assign bpfSpec: %v", err)
 	}
 
-	// err = objs.lbMaps.DportForwardMap.Put(sPort, dPort)
-	// if err != nil {
-	// 	objs.Close()
-	// 	return nil, fmt.Errorf("cannot put dport forward map: %v", err)
-	// }
-
 	err = objs.lbMaps.DnatMap.Put(DNATKey{SPort: sPort, SAddr: ip2Uint32(sIPV4)}, DNATValue{DPort: dPort, DAddr: ip2Uint32(dIPV4)})
 	if err != nil {
 		objs.Close()
 		return nil, fmt.Errorf("cannot put DNAT map: %v", err)
 	}
 
-	l, err := link.AttachXDP(link.XDPOptions{
-		Interface: iface.Index,
-		Program:   objs.SimpleLb,
-	})
-
-	if err != nil {
-		objs.Close()
-		return nil, fmt.Errorf("cannot attach XDP program: %v", err)
-	}
-
 	// Create tc filter and attach ebpf prog to egress
-
-	progFd := objs.SimpleLbEgress.FD()
 
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
@@ -156,11 +134,11 @@ func loadEbpf(iface *net.Interface, sPort, dPort uint16, dIPV4 net.IP) (func(), 
 	err = netlink.QdiscReplace(qdisc)
 	if err != nil {
 		objs.Close()
-		l.Close()
+		// l.Close()
 		return nil, fmt.Errorf("failed to replace qdisc: %v", err)
 	}
 
-	filter := &netlink.BpfFilter{
+	egressFilter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: iface.Index,
 			Parent:    netlink.HANDLE_MIN_EGRESS,
@@ -168,21 +146,39 @@ func loadEbpf(iface *net.Interface, sPort, dPort uint16, dIPV4 net.IP) (func(), 
 			Protocol:  unix.ETH_P_ALL,
 			Priority:  20,
 		},
-		Fd:           progFd,
+		Fd:           objs.SimpleLbEgress.FD(),
 		Name:         "simple-lb-egress",
 		DirectAction: true,
 	}
 
-	err = netlink.FilterReplace(filter)
+	err = netlink.FilterReplace(egressFilter)
 	if err != nil {
 		objs.Close()
-		l.Close()
-		return nil, fmt.Errorf("replace ebpf filter failed: %v", err)
+		// l.Close()
+		return nil, fmt.Errorf("replace simple-lb-egress ebpf filter failed: %v", err)
+	}
+
+	ingressFilter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: iface.Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    netlink.MakeHandle(0, 1),
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  20,
+		},
+		Fd:           objs.SimpleLbIngress.FD(),
+		Name:         "simple-lb-ingress",
+		DirectAction: true,
+	}
+	err = netlink.FilterReplace(ingressFilter)
+	if err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("add simple-lb-ingress ebpf filter failed: %v", err)
 	}
 
 	closeFunc := func() {
 		objs.Close()
-		l.Close()
+		// l.Close()
 	}
 
 	return closeFunc, nil

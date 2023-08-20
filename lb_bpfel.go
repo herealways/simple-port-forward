@@ -54,8 +54,8 @@ type lbSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type lbProgramSpecs struct {
-	SimpleLb       *ebpf.ProgramSpec `ebpf:"simple_lb"`
-	SimpleLbEgress *ebpf.ProgramSpec `ebpf:"simple_lb_egress"`
+	SimpleLbEgress  *ebpf.ProgramSpec `ebpf:"simple_lb_egress"`
+	SimpleLbIngress *ebpf.ProgramSpec `ebpf:"simple_lb_ingress"`
 }
 
 // lbMapSpecs contains maps before they are loaded into the kernel.
@@ -100,14 +100,14 @@ func (m *lbMaps) Close() error {
 //
 // It can be passed to loadLbObjects or ebpf.CollectionSpec.LoadAndAssign.
 type lbPrograms struct {
-	SimpleLb       *ebpf.Program `ebpf:"simple_lb"`
-	SimpleLbEgress *ebpf.Program `ebpf:"simple_lb_egress"`
+	SimpleLbEgress  *ebpf.Program `ebpf:"simple_lb_egress"`
+	SimpleLbIngress *ebpf.Program `ebpf:"simple_lb_ingress"`
 }
 
 func (p *lbPrograms) Close() error {
 	return _LbClose(
-		p.SimpleLb,
 		p.SimpleLbEgress,
+		p.SimpleLbIngress,
 	)
 }
 

@@ -4,14 +4,6 @@
 // Everything is host order
 // For now only support TCP
 
-// struct bpf_map_def dport_forward_map SEC("maps") = {
-//     .type = BPF_MAP_TYPE_HASH,
-//     .key_size = sizeof(__u16),
-//     .value_size = sizeof(__u16),
-//     .max_entries = 1024,
-// };
-
-
 typedef struct dnat_key_t
 {
     unsigned int saddr;

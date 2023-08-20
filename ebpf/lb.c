@@ -10,8 +10,14 @@
 #include <bpf/bpf_endian.h>
 #include <arpa/inet.h>
 #include "lib/lib_maps.h"
+#include "lib/parse_helpers.h"
 // #include "lib/vmlinux.h"
 
+
+#define TCP_CSUM_OFF (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, check))
+#define IP_DEST_OFF (ETH_HLEN + offsetof(struct iphdr, daddr))
+#define TCP_DPORT_OFF (ETH_HLEN + sizeof(struct iphdr) + offsetof(struct tcphdr, dest))
+#define IS_PSEUDO 0x10
 
 char __license[] SEC("license") = "Dual MIT/GPL";
 
@@ -37,34 +43,36 @@ static __always_inline void ipv4_csum(void *data_start, int data_size,
 
 
 
-SEC("xdp")
-int simple_lb(struct xdp_md *ctx)
+SEC("lb_ingress")
+int simple_lb_ingress(struct __sk_buff *skb)
 {
-    void *data_end = (void *)(long)ctx->data_end;
-    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)skb->data_end;
+    void *data = (void *)(long)skb->data;
     int iphsize;
     unsigned short dport;
+    struct iphdr *ip;
+    if (__revalidate_data_pull(skb, &data, &data_end, (void *)&ip, sizeof(struct iphdr), sizeof(struct tcphdr), true))
+        return TC_ACT_OK;
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return XDP_DROP;
+        return TC_ACT_OK;
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return XDP_PASS;
+        return TC_ACT_OK;
 
-    struct iphdr *ip = data + sizeof(*eth);
     if ((void *)(ip + 1) > data_end)
-        return XDP_DROP;
+        return TC_ACT_OK;
     
     if (ip->protocol != IPPROTO_TCP)
-        return XDP_PASS;
+        return TC_ACT_OK;
 
     iphsize = ip->ihl * 4;
 
 
     struct tcphdr *tcp = data + sizeof(*eth) + iphsize;
     if ((void *)(tcp + 1) > data_end)
-        return XDP_DROP;
+        return TC_ACT_OK;
 
     // simple port forward
     // unsigned short *forward_port;
@@ -77,66 +85,48 @@ int simple_lb(struct xdp_md *ctx)
     dnat_value_t *dnat_value = bpf_map_lookup_elem(&dnat_map, &dnat_key);
 
     if (dnat_value) {
-        // update dport
-        struct tcphdr tcp_old;
-        __u16 old_csum = tcp->check;
-        tcp->check = 0;
-        tcp_old = *tcp;
+        // update dport new method update csum
         __u16 old_dport = tcp->dest;
+        __u16 new_dport = bpf_htons(dnat_value->dport);
+        tcp->dest = new_dport;
 
-        tcp->dest = bpf_htons(dnat_value->dport);
+        // TODO why don't update checksum still work?
+        // TODO verifier error
+        
+        if (bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_dport, new_dport, sizeof(new_dport)))
+            return TC_ACT_OK;
 
-        __u32 csum, size = sizeof(struct tcphdr);
-        csum = bpf_csum_diff((__be32 *) &tcp_old, size, (__be32 *)tcp, size, ~old_csum);
-        csum = csum_fold_helper(csum);
+        if (__revalidate_data_pull(skb, &data, &data_end, (void *)&ip, sizeof(struct iphdr), sizeof(struct tcphdr), false))
+            return TC_ACT_OK;
 
-        tcp->check = csum;
+        // if ((data + sizeof(*eth) + iphsize + sizeof(*tcp)) > data_end)
+        //     return TC_ACT_OK;
 
-        bpf_printk("tcp checksum after change dport: %d\n", tcp->check);
 
         // update daddr
-        // TODO why ip checksum correct, but tcp incorrect? When not updating ip header, tcp checksum is correct
-        unsigned int dnat_daddr = bpf_htonl(dnat_value->daddr);
-        if (ip->daddr != dnat_daddr) {
-            struct iphdr ip_old;
-            __u16 old_csum = ip->check;
-            ip->check = 0;
-            ip_old = *ip;
-            __be32 old_daddr = ip->daddr;
+        unsigned int new_daddr = bpf_htonl(dnat_value->daddr);
+        if (ip->daddr != new_daddr) {
+            unsigned int old_daddr = ip->daddr;
+            ip->saddr = old_daddr;
+            ip->daddr = new_daddr;
 
-            ip->daddr = dnat_daddr;
-
-            __u32 csum, size = sizeof(struct iphdr);
-            csum = bpf_csum_diff((__be32 *) &ip_old, size, (__be32 *)ip, size, ~old_csum);
-            csum = csum_fold_helper(csum);
-
-            ip->check = csum;
+            // TODO why don't update checksum still work?
+            // TODO verifier error
+            if (bpf_l4_csum_replace(skb, TCP_CSUM_OFF, old_daddr, new_daddr, IS_PSEUDO | sizeof(new_dport)))
+                return TC_ACT_OK;
+            if (bpf_l3_csum_replace(skb, IP_DEST_OFF, old_daddr, new_daddr, sizeof(new_daddr)))
+                return TC_ACT_OK;
+            if (__revalidate_data_pull(skb, &data, &data_end, (void *)&ip, sizeof(struct iphdr), sizeof(struct tcphdr), false))
+                return TC_ACT_OK;
         }
 
-        bpf_printk("tcp checksum after change daddr: %d\n", tcp->check);
-
-
-        // https://elixir.bootlin.com/linux/v6.0/source/samples/bpf/xdp_adjust_tail_kern.c#L63
-        // TODO not calculated correctly
-        // unsigned int dnat_daddr = bpf_htonl(dnat_value->daddr);
-        // if (ip->daddr != dnat_daddr) {
-        //     ip->daddr = dnat_daddr;
-        //     ip->check = 0;
-        //     __u32 csum = 0;
-        //     ipv4_csum(ip, sizeof(struct iphdr), &csum);
-        //     ip->check = csum;
-        // }
-
+        // TODO lookup FIB and change mac addr?
 
         // update conntrack map
 
-        // need to initialize all fields of struct, before updating it. Otherwise verifier will reject the prog
-        // https://stackoverflow.com/questions/71529801/ebpf-bpf-map-update-returns-the-invalid-indirect-read-from-stack-error
+
         struct conntrack_key_t conn_key = {0};
         struct conntrack_value_t conn_value = {0};
-        // or
-        // memset(&conn_key, 0, sizeof(conn_key));
-        // memset(&conn_value, 0, sizeof(conn_value));
  
         conn_key.proto = ip->protocol;
         conn_key.saddr = bpf_ntohs(ip->saddr);
@@ -149,7 +139,7 @@ int simple_lb(struct xdp_md *ctx)
         bpf_map_update_elem(&ct_map, &conn_key, &conn_value, BPF_ANY);
     }
 
-    return XDP_PASS;
+    return TC_ACT_OK;
 }
 
 
@@ -161,6 +151,9 @@ SEC("lb_egress")
 int simple_lb_egress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    struct iphdr *ip;
+    if (__revalidate_data_pull(skb, &data, &data_end, (void *)&ip, sizeof(struct iphdr), sizeof(struct tcphdr), true))
+        return TC_ACT_OK;
 
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
@@ -168,8 +161,7 @@ int simple_lb_egress(struct __sk_buff *skb) {
 
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return TC_ACT_OK;
-    
-   struct iphdr *ip = data + sizeof(*eth);
+
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
@@ -193,6 +185,7 @@ int simple_lb_egress(struct __sk_buff *skb) {
     // TODO why don't need update checksum here? checksum offload?
     if (conn_value) {
         tcp->source = bpf_htons(conn_value->dport);
+        ip->saddr = bpf_htonl(conn_value->daddr);
     }
 
     return TC_ACT_OK;
